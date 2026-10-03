@@ -13,6 +13,8 @@ It has two parts:
 - **The editor** (Qt): an image, a title or a batch on the left, a live preview in the middle and every parameter on the right. The preview re-renders while you drag a slider.
 - **The command line:** the same prints, presets and batch, for scripts.
 
+![The editor: a game frame printed as a two-color riso, before and after](docs/images/editor-image.png)
+
 ![The three modes](docs/images/modes.jpg)
 
 ## Contents
@@ -84,11 +86,15 @@ The title is drawn on a transparent canvas, which the plugin's text mode needs t
 
 An outline is knocked out of the scrap instead of being flattened, so outlined titles stay readable.
 
+![The Text tab](docs/images/editor-text.png)
+
 ### Batch tab
 
 Add files or folders, or drop them onto the window. Picking a file in the list previews it with the current parameters. For a video, the **Frame** slider scrubs through it.
 
 Then choose an output folder, formats and size, and press **Start**. See [Batch: images and videos](#batch-images-and-videos).
+
+![The Batch tab after a run: an image, a photo and a video printed with the Pink riso sticker preset](docs/images/editor-batch.png)
 
 ### Preview
 
@@ -128,6 +134,8 @@ These are the same parameters, labels, ranges and tooltips as the Kdenlive effec
 The interface is in English or Brazilian Portuguese. Switch with the language box at the right end of the menu bar, or **View → Language**. The window is rebuilt in the new language right away, keeping the open image, the batch list and every setting. The first start follows the system language; `ZINEKIT_LANG=pt_BR` or `ZINEKIT_LANG=en` overrides it. The command line is always in English.
 
 No text is hardcoded in the interface. Every text comes from `zinekit/locales/<code>.json`, a flat JSON file that maps the English text to the translation, with `"_language"` as the name shown in the menu. To add a language, copy `en.json` to e.g. `es.json`, translate the values and restart; it appears in the menu by itself. `tests/test_i18n.py` fails when a file is missing a text, keeps one the code no longer uses, or changes a `%s`/`%d` placeholder.
+
+![The editor in Portuguese](docs/images/editor-pt-BR.png)
 
 The editor remembers the parameters, the preset, the text and the batch settings between sessions, in `~/.config/zinekit/zinekit.conf`.
 
@@ -323,7 +331,8 @@ zinekit/
 ```sh
 python3 -m unittest discover -s tests -t .       # all tests (needs Pillow; ffmpeg for the video tests)
 ./run.sh --selftest                              # the same inside the venv, editor included
-python3 docs/make_examples.py                    # rebuild docs/images
+python3 docs/make_examples.py                    # rebuild the example prints in docs/images
+QT_QPA_PLATFORM=offscreen .venv/bin/python docs/make_screenshots.py   # retake the editor screenshots
 ```
 
 - **Tests** cover the engine against the plugin's parameter table and the modes, parameters and presets, the text layer, image batches and every video format (alpha, audio, scaling, cancel), the preview worker, and the CLI.

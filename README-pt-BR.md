@@ -13,6 +13,8 @@ São duas partes:
 - **O editor** (Qt): imagem, título ou lote à esquerda, prévia ao vivo no meio e todos os parâmetros à direita. A prévia é refeita enquanto você arrasta o controle.
 - **A linha de comando:** as mesmas impressões, predefinições e processamento em massa, para scripts.
 
+![O editor em português: um título em letras de bilhete de resgate](docs/images/editor-pt-BR.png)
+
 ![Os três modos](docs/images/modes.jpg)
 
 ## Sumário
@@ -84,11 +86,15 @@ O título é desenhado numa tela transparente, que é o que o modo texto do plug
 
 O contorno é vazado no recorte em vez de achatado, então títulos com contorno continuam legíveis.
 
+![A aba Texto](docs/images/editor-text.png)
+
 ### Aba Em massa
 
 Adicione arquivos ou pastas, ou solte na janela. Ao escolher um arquivo na lista, ele aparece na prévia com os parâmetros atuais. Num vídeo, o controle **Quadro** percorre o vídeo.
 
 Depois escolha a pasta de saída, os formatos e o tamanho, e aperte **Começar**. Veja [Em massa: imagens e vídeos](#em-massa-imagens-e-vídeos).
+
+![A aba Em massa depois de rodar: uma imagem, uma foto e um vídeo com a predefinição Adesivo riso rosa](docs/images/editor-batch.png)
 
 ### Prévia
 
@@ -98,6 +104,8 @@ Depois escolha a pasta de saída, os formatos e o tamanho, e aperte **Começar**
 | botão **Antes**, ou segurar **Espaço** | mostra o original enquanto segura |
 | fundo | xadrez, preto, cinza ou branco atrás das impressões transparentes |
 | **540p / 720p / 1080p / Completa** | a resolução em que a prévia é renderizada |
+
+![Antes e depois no modo Dividido: um quadro do jogo como riso de duas cores](docs/images/editor-image.png)
 
 A prévia é renderizada numa thread separada, e só o pedido mais novo é renderizado. Arrastando um controle, a imagem acompanha em vez de acumular quadros velhos. O tempo de cada renderização aparece à direita.
 
@@ -325,7 +333,8 @@ zinekit/
 ```sh
 python3 -m unittest discover -s tests -t .       # todos os testes (precisa do Pillow; ffmpeg para os de vídeo)
 ./run.sh --selftest                              # o mesmo dentro do venv, com o editor
-python3 docs/make_examples.py                    # refaz docs/images
+python3 docs/make_examples.py                    # refaz as impressões de exemplo em docs/images
+QT_QPA_PLATFORM=offscreen .venv/bin/python docs/make_screenshots.py   # tira de novo as capturas do editor
 ```
 
 - **Os testes** cobrem o motor contra a tabela de parâmetros do plugin e os modos, parâmetros e predefinições, a camada de texto, lotes de imagem e todos os formatos de vídeo (alfa, áudio, escala, cancelar), a thread da prévia e a linha de comando.

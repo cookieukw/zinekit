@@ -411,7 +411,7 @@ class BatchTab(SourceTab):
         self.cancel_btn = QPushButton(tr("Cancel"))
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.clicked.connect(lambda: self.cancel())
-        self.open_out = QPushButton(tr("Output folder"))
+        self.open_out = QPushButton(tr("Open output folder"))
         self.open_out.setEnabled(False)
         self.open_out.clicked.connect(lambda: self._open_output())
         self.bar = QProgressBar()

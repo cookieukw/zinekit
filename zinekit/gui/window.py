@@ -113,7 +113,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.image_tab, tr("Image"))
         self.tabs.addTab(self.text_tab, tr("Text"))
         self.tabs.addTab(self.batch_tab, tr("Batch"))
-        self.tabs.setMinimumWidth(300)
+        self.tabs.setMinimumWidth(330)
         for tab in self._all_tabs():
             tab.sourceChanged.connect(lambda t=tab: self._source_changed(t))
             tab.saveRequested.connect(self.save_result)
@@ -128,7 +128,7 @@ class MainWindow(QMainWindow):
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
         self.splitter.setStretchFactor(2, 0)
-        self.splitter.setSizes([330, 900, 380])
+        self.splitter.setSizes([360, 860, 380])
         self.setCentralWidget(self.splitter)
         self._build_menus()
         self.resize(1560, 900)
