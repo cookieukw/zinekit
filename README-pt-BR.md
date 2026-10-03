@@ -4,9 +4,9 @@
 
 ![zinekit](docs/images/text.jpg)
 
-O zinekit aplica a impressão **Punk Zine** fora do Kdenlive. Ele transforma imagens, títulos digitados e pastas inteiras de imagens e vídeos em fanzine xerocado dos anos 70: letras de bilhete de resgate, adesivos recortados na tesoura, retícula de xerox e de riso.
+O zinekit transforma imagens, títulos digitados e pastas inteiras de imagens e vídeos em fanzine xerocado dos anos 70: letras de bilhete de resgate, adesivos recortados na tesoura, retícula de xerox e de riso.
 
-Ele roda o mesmo plugin frei0r do efeito do Kdenlive, compilado do mesmo código C. Uma imagem feita aqui fica igual ao que o Kdenlive renderiza com os mesmos valores.
+O visual vem do **Punk Zine**, um filtro frei0r feito junto com o zinekit. O frei0r é o formato de plugin que ferramentas de vídeo como o ffmpeg e o MLT carregam, então o mesmo filtro também roda nelas. O zinekit traz o código C do filtro e compila na primeira vez; não precisa instalar mais nada.
 
 São duas partes:
 
@@ -25,7 +25,7 @@ São duas partes:
 - [Linha de comando](#linha-de-comando)
 - [Parâmetros](#parâmetros)
 - [Predefinições](#predefinições)
-- [O mesmo visual no Kdenlive e no ffmpeg](#o-mesmo-visual-no-kdenlive-e-no-ffmpeg)
+- [O mesmo visual no ffmpeg](#o-mesmo-visual-no-ffmpeg)
 - [Como funciona](#como-funciona)
 - [Desenvolvimento](#desenvolvimento)
 - [Problemas comuns](#problemas-comuns)
@@ -82,7 +82,7 @@ Digite um título (pode ter várias linhas) e escolha:
 - alinhamento, espaço entre linhas e entre letras;
 - tela: 1920×1080, 1280×720, 4K, quadrado, 4:5, 9:16 ou *Ajustar ao texto*; e margem.
 
-O título é desenhado numa tela transparente, que é o que o modo texto do plugin precisa para recortar cada letra no seu próprio pedaço de papel. **Salvar PNG…** mantém a transparência, então o arquivo vai direto para uma trilha do Kdenlive.
+O título é desenhado numa tela transparente, que é o que o modo texto do plugin precisa para recortar cada letra no seu próprio pedaço de papel. **Salvar PNG…** mantém a transparência, então o arquivo vai direto para uma trilha de um editor de vídeo.
 
 O contorno é vazado no recorte em vez de achatado, então títulos com contorno continuam legíveis.
 
@@ -113,7 +113,7 @@ Todas as medidas do efeito (célula da retícula, bordas roídas, sombra, margem
 
 ### Painel de parâmetros
 
-São os mesmos parâmetros, nomes, faixas e dicas do efeito do Kdenlive, agrupados em Geral, Texto, Elemento, Imagem, Retícula, Cores e Layout.
+São todos os parâmetros do filtro, agrupados em Geral, Texto, Elemento, Imagem, Retícula, Cores e Layout. Cada um tem uma dica que diz o que faz e em qual modo vale.
 
 - Os parâmetros que o **Modo de impressão** escolhido não usa ficam cinza (no *Detectar sozinho* todos ficam ativos).
 - **Clique duas vezes no nome** para restaurar o padrão daquele parâmetro.
@@ -161,7 +161,7 @@ Saídas de vídeo:
 | formato | transparência | áudio | observação |
 |---|---|---|---|
 | MP4 H.264 | achatada sobre o *Fundo* | AAC, copiado do original | toca em qualquer lugar |
-| MOV ProRes 4444 | ✓ | PCM | para edição; o Kdenlive lê o alfa |
+| MOV ProRes 4444 | ✓ | PCM | para edição; editores de vídeo leem o alfa |
 | WebM VP9 | ✓ | Opus | pequeno, com alfa |
 | Sequência PNG | ✓ | nenhum | uma pasta de `frame_000001.png` |
 | GIF | ✓ (1 bit) | nenhum | paleta feita a partir do vídeo |
@@ -221,9 +221,9 @@ zinekit build --force       # recompila o plugin
 
 ## Parâmetros
 
-O nome no painel do editor em português, e entre parênteses como aparece no efeito do Kdenlive (em inglês).
+O nome no painel em português e, entre parênteses, com a interface em inglês.
 
-| nome | no painel (Kdenlive) | padrão | valores | vale para |
+| nome | no painel | padrão | valores | vale para |
 |---|---|---|---|---|
 | `mode` | Modo de impressão (Print mode) | Detectar sozinho | auto, text, element, image | todos |
 | `mix` | Intensidade do efeito (Effect amount) | 100% | 0–100% | todos |
@@ -233,16 +233,16 @@ O nome no painel do editor em português, e entre parênteses como aparece no ef
 | `misregistration` | Fora de registro (Misregistration) | 40% | 0–100% | todos (imagem: estilos riso) |
 | `shadow` | Distância da sombra (Shadow distance) | 50% | 0–100% | texto, elemento |
 | `shadow_opacity` | Opacidade da sombra (Shadow opacity) | 50% | 0–100% | texto, elemento |
-| `scrap_palette` | Texto → Recortes (Text: scraps) | Misturado | mixed, bw, plate, plate2, none | texto |
-| `chaos` | Texto → Bagunça (Text: chaos) | 60% | 0–100% | texto |
-| `scrap_padding` | Texto → Margem do recorte (Text: padding) | 50% | 0–100% | texto |
-| `keep_text_color` | Texto → Manter a cor (Text: keep color) | desligado | on, off | texto |
-| `element_style` | Elemento → Estilo (Element: style) | Detectar sozinho | auto, riso, palette, xerox, original | elemento |
-| `cut_margin` | Elemento → Margem (Element: margin) | 50% | 0–100% | elemento |
-| `outline` | Elemento → Contorno (Element: outline) | 30% | 0–100% | elemento |
-| `recolor` | Elemento → Recolorir (Element: recolor) | 100% | 0–100% | elemento |
-| `image_style` | Imagem → Estilo (Image: style) | Xerox | xerox, riso, riso2, photocopy | imagem |
-| `burn` | Imagem → Queimado (Image: burn) | 35% | 0–100% | imagem |
+| `scrap_palette` | Texto → Recortes (Text → Scraps) | Misturado | mixed, bw, plate, plate2, none | texto |
+| `chaos` | Texto → Bagunça (Text → Chaos) | 60% | 0–100% | texto |
+| `scrap_padding` | Texto → Margem do recorte (Text → Padding) | 50% | 0–100% | texto |
+| `keep_text_color` | Texto → Manter a cor (Text → Keep color) | desligado | on, off | texto |
+| `element_style` | Elemento → Estilo (Element → Style) | Detectar sozinho | auto, riso, palette, xerox, original | elemento |
+| `cut_margin` | Elemento → Margem (Element → Margin) | 50% | 0–100% | elemento |
+| `outline` | Elemento → Contorno (Element → Outline) | 30% | 0–100% | elemento |
+| `recolor` | Elemento → Recolorir (Element → Recolor) | 100% | 0–100% | elemento |
+| `image_style` | Imagem → Estilo (Image → Style) | Xerox | xerox, riso, riso2, photocopy | imagem |
+| `burn` | Imagem → Queimado (Image → Burn) | 35% | 0–100% | imagem |
 | `dot_size` | Retícula → Tamanho do ponto (Dot size) | 22% | 0–100% | elemento, imagem |
 | `dot_angle` | Retícula → Ângulo do ponto (Dot angle) | 45° | 0–45° | elemento, imagem |
 | `contrast` | Retícula → Contraste do xerox (Xerox contrast) | 55% | 0–100% | elemento, imagem |
@@ -293,17 +293,15 @@ As predefinições do usuário são arquivos JSON em `~/.config/zinekit/presets/
 }
 ```
 
-## O mesmo visual no Kdenlive e no ffmpeg
+## O mesmo visual no ffmpeg
 
-**Kdenlive.** O painel do editor usa os mesmos nomes e unidades do efeito. Para repetir uma impressão, coloque os mesmos números no efeito Punk Zine do Kdenlive.
-
-**ffmpeg.** `zinekit ffmpeg` (ou **⋯ → Copiar filtro do ffmpeg**) mostra o filtro frei0r com todos os parâmetros na ordem.
+`zinekit ffmpeg` (ou **⋯ → Copiar filtro do ffmpeg**) mostra o filtro frei0r com todos os parâmetros na ordem.
 
 ```sh
 FREI0R_PATH=~/.cache/zinekit/frei0r-1 ffmpeg -i in.mp4 -vf "format=rgba,$(zinekit ffmpeg -p 'Riso duotone')" out.mp4
 ```
 
-`~/.cache/zinekit/frei0r-1/punkzine.so` sempre aponta para a compilação atual (`zinekit build` mostra o caminho). A instalação do Kdenlive (`~/.var/app/org.kde.kdenlive/data/frei0r-1`) também serve. Com os mesmos pixels de entrada, a saída do ffmpeg e a do zinekit diferem em no máximo 1/255 por canal.
+`~/.cache/zinekit/frei0r-1/punkzine.so` sempre aponta para a compilação atual (`zinekit build` mostra o caminho). Com os mesmos pixels de entrada, a saída do ffmpeg e a do zinekit diferem em no máximo 1/255 por canal. Outros hosts frei0r (o MLT, por exemplo) carregam o mesmo módulo dessa pasta.
 
 ## Como funciona
 
@@ -324,7 +322,7 @@ zinekit/
 └── gui/                o editor em PySide6
 ```
 
-- **Motor.** `native/punkzine.c` é compilado com `cc -O3 -fPIC -shared` em `~/.cache/zinekit/punkzine-<hash>.so`, e só é recompilado quando o código muda. O módulo é carregado do jeito que um host frei0r carrega: `f0r_construct`, `f0r_set_param_value`, `f0r_update`. O ctypes solta o GIL durante o `f0r_update`, então a renderização roda em paralelo com a interface. Sem compilador, o zinekit usa um `punkzine.so` já instalado (o do Kdenlive Flatpak, `~/.frei0r-1/lib`, `/usr/lib/frei0r-1`) ou o arquivo apontado por `ZINEKIT_PLUGIN`.
+- **Motor.** `native/punkzine.c` é compilado com `cc -O3 -fPIC -shared` em `~/.cache/zinekit/punkzine-<hash>.so`, e só é recompilado quando o código muda. O módulo é carregado do jeito que um host frei0r carrega: `f0r_construct`, `f0r_set_param_value`, `f0r_update`. O ctypes solta o GIL durante o `f0r_update`, então a renderização roda em paralelo com a interface. Sem compilador, o zinekit usa um `punkzine.so` que já esteja numa das pastas comuns do frei0r (`~/.frei0r-1/lib`, `/usr/lib/frei0r-1`, …) ou o arquivo apontado por `ZINEKIT_PLUGIN`.
 - **Vídeo.** Um ffmpeg decodifica a entrada em quadros RGBA crus: taxa de quadros constante, escalados, com a rotação aplicada. O plugin imprime cada quadro. Um segundo ffmpeg codifica os quadros e copia a trilha de áudio do original. Leitura, impressão e escrita rodam em três threads.
 - **Prévia.** A origem é reduzida para o tamanho da prévia uma vez. Cada mudança de parâmetro manda um trabalho para uma thread; os trabalhos que ainda estão esperando são trocados pelo mais novo. A instância do plugin é mantida por tamanho de quadro, então o modo elemento reaproveita o recorte entre uma renderização e outra.
 
@@ -343,7 +341,7 @@ QT_QPA_PLATFORM=offscreen .venv/bin/python docs/make_screenshots.py   # tira de 
 
 ## Problemas comuns
 
-- **"no C compiler found":** instale um (`sudo pacman -S gcc`, `sudo apt install build-essential`, `sudo dnf install gcc`). Também dá para usar o módulo instalado para o Kdenlive, que o zinekit encontra sozinho, ou definir `ZINEKIT_PLUGIN=/caminho/para/punkzine.so`.
+- **"no C compiler found":** instale um (`sudo pacman -S gcc`, `sudo apt install build-essential`, `sudo dnf install gcc`). Se você já tem uma compilação do filtro, `ZINEKIT_PLUGIN=/caminho/para/punkzine.so` usa ela.
 - **O editor não abre e o Qt fala de "xcb":** o PySide6 6.5+ precisa de `libxcb-cursor0` no X11 (`sudo apt install libxcb-cursor0`). No Wayland, dá para tentar `QT_QPA_PLATFORM=wayland ./run.sh`.
 - **O pip não encontra o PySide6:** seu Python pode ser novo demais para os pacotes do PySide6. Tente `PYTHON=python3.12 ./run.sh --update`.
 - **Os vídeos são pulados:** instale o ffmpeg. Depois rode `./run.sh doctor` para ver os codificadores encontrados. Sem libx264, o MP4 usa OpenH264 ou MPEG-4.

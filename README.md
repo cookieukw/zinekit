@@ -4,9 +4,9 @@
 
 ![zinekit](docs/images/text.jpg)
 
-zinekit applies the **Punk Zine** print outside Kdenlive. It turns images, typed titles and whole folders of images and videos into a 1970s photocopied zine: ransom-note letters, scissor-cut stickers, xerox and riso halftone.
+zinekit turns images, typed titles and whole folders of images and videos into a 1970s photocopied zine: ransom-note letters, scissor-cut stickers, xerox and riso halftone.
 
-It runs the same frei0r plugin as the Kdenlive effect, built from the same C source, so a picture made here matches what Kdenlive renders with the same values.
+The look comes from **Punk Zine**, a frei0r filter written alongside zinekit. frei0r is the plugin format that video tools such as ffmpeg and MLT load, so the same filter can also run there. zinekit ships the filter's C source and compiles it on the first run; nothing else needs to be installed.
 
 It has two parts:
 
@@ -25,7 +25,7 @@ It has two parts:
 - [Command line](#command-line)
 - [Parameters](#parameters)
 - [Presets](#presets)
-- [Same look in Kdenlive and ffmpeg](#same-look-in-kdenlive-and-ffmpeg)
+- [Same look in ffmpeg](#same-look-in-ffmpeg)
 - [How it works](#how-it-works)
 - [Development](#development)
 - [Troubleshooting](#troubleshooting)
@@ -82,7 +82,7 @@ Type a title (several lines are fine) and pick:
 - alignment, line and letter spacing;
 - canvas: 1920×1080, 1280×720, 4K, square, 4:5, 9:16, or *Fit to text*; and margin.
 
-The title is drawn on a transparent canvas, which the plugin's text mode needs to cut every letter onto its own scrap. **Save PNG…** keeps the transparency, so the file can go straight onto a Kdenlive track.
+The title is drawn on a transparent canvas, which the plugin's text mode needs to cut every letter onto its own scrap. **Save PNG…** keeps the transparency, so the file can go straight onto a track in a video editor.
 
 An outline is knocked out of the scrap instead of being flattened, so outlined titles stay readable.
 
@@ -111,7 +111,7 @@ Every length in the effect (halftone cell, rough edges, shadow, scrap padding) s
 
 ### Parameters panel
 
-These are the same parameters, labels, ranges and tooltips as the Kdenlive effect, grouped into General, Text, Element, Image, Halftone, Colors and Layout.
+These are all of the filter's parameters, grouped into General, Text, Element, Image, Halftone, Colors and Layout. Each one has a tooltip that says what it does and which mode uses it.
 
 - Parameters the selected **Print mode** does not use are greyed out (all of them are active in *Auto detect*).
 - **Double-click a label** to reset that parameter.
@@ -161,7 +161,7 @@ Video outputs:
 | format | transparency | audio | notes |
 |---|---|---|---|
 | MP4 H.264 | flattened over *Background* | AAC, copied from the source | plays everywhere |
-| MOV ProRes 4444 | ✓ | PCM | for editing; Kdenlive reads the alpha |
+| MOV ProRes 4444 | ✓ | PCM | for editing; video editors read the alpha |
 | WebM VP9 | ✓ | Opus | small, with alpha |
 | PNG sequence | ✓ | none | a folder of `frame_000001.png` |
 | GIF | ✓ (1-bit) | none | palette made from the clip |
@@ -291,17 +291,15 @@ User presets are JSON files in `~/.config/zinekit/presets/` (`$XDG_CONFIG_HOME` 
 }
 ```
 
-## Same look in Kdenlive and ffmpeg
+## Same look in ffmpeg
 
-**Kdenlive.** The editor panel uses the effect's own labels and units. To recreate a print, set the same numbers on the Punk Zine effect in Kdenlive.
-
-**ffmpeg.** `zinekit ffmpeg` (or **⋯ → Copy ffmpeg filter**) prints the frei0r filter string with every parameter in order.
+`zinekit ffmpeg` (or **⋯ → Copy ffmpeg filter**) prints the frei0r filter string with every parameter in order.
 
 ```sh
 FREI0R_PATH=~/.cache/zinekit/frei0r-1 ffmpeg -i in.mp4 -vf "format=rgba,$(zinekit ffmpeg -p 'Riso duotone')" out.mp4
 ```
 
-`~/.cache/zinekit/frei0r-1/punkzine.so` always links to the current build (`zinekit build` prints the path). The Kdenlive install (`~/.var/app/org.kde.kdenlive/data/frei0r-1`) works too. With the same input pixels, ffmpeg's output and zinekit's differ by at most 1/255 per channel.
+`~/.cache/zinekit/frei0r-1/punkzine.so` always links to the current build (`zinekit build` prints the path). With the same input pixels, ffmpeg's output and zinekit's differ by at most 1/255 per channel. Other frei0r hosts (MLT, for instance) can load the same module from that folder.
 
 ## How it works
 
@@ -322,7 +320,7 @@ zinekit/
 └── gui/                the PySide6 editor
 ```
 
-- **Engine.** `native/punkzine.c` is compiled with `cc -O3 -fPIC -shared` into `~/.cache/zinekit/punkzine-<hash>.so`. It is rebuilt only when the source changes. The module is loaded the way a frei0r host loads it: `f0r_construct`, `f0r_set_param_value`, `f0r_update`. ctypes releases the GIL during `f0r_update`, so renders run in parallel with the interface. Without a compiler, zinekit uses an installed `punkzine.so` (the Kdenlive Flatpak one, `~/.frei0r-1/lib`, `/usr/lib/frei0r-1`) or the file named by `ZINEKIT_PLUGIN`.
+- **Engine.** `native/punkzine.c` is compiled with `cc -O3 -fPIC -shared` into `~/.cache/zinekit/punkzine-<hash>.so`. It is rebuilt only when the source changes. The module is loaded the way a frei0r host loads it: `f0r_construct`, `f0r_set_param_value`, `f0r_update`. ctypes releases the GIL during `f0r_update`, so renders run in parallel with the interface. Without a compiler, zinekit uses a `punkzine.so` already in one of the usual frei0r folders (`~/.frei0r-1/lib`, `/usr/lib/frei0r-1`, …) or the file named by `ZINEKIT_PLUGIN`.
 - **Video.** One ffmpeg decodes the input to raw RGBA frames: constant frame rate, scaled, rotation applied. The plugin prints each frame. A second ffmpeg encodes the frames and copies the audio track of the original. Reading, printing and writing run on three threads.
 - **Preview.** The source is downscaled to the preview size once. Each parameter change submits a job to one worker thread; jobs that are still waiting are replaced by the newest one. The plugin instance is kept per frame size, so the element mode reuses its cut-out between renders.
 
@@ -341,7 +339,7 @@ QT_QPA_PLATFORM=offscreen .venv/bin/python docs/make_screenshots.py   # retake t
 
 ## Troubleshooting
 
-- **"no C compiler found":** install one (`sudo pacman -S gcc`, `sudo apt install build-essential`, `sudo dnf install gcc`). You can also use the module installed for Kdenlive, which zinekit picks up by itself, or set `ZINEKIT_PLUGIN=/path/to/punkzine.so`.
+- **"no C compiler found":** install one (`sudo pacman -S gcc`, `sudo apt install build-essential`, `sudo dnf install gcc`). If you already have a build of the filter, `ZINEKIT_PLUGIN=/path/to/punkzine.so` uses it instead.
 - **The editor does not open, and Qt mentions "xcb":** PySide6 6.5+ needs `libxcb-cursor0` on X11 (`sudo apt install libxcb-cursor0`). On Wayland you can also try `QT_QPA_PLATFORM=wayland ./run.sh`.
 - **pip cannot find PySide6:** your Python may be too new for the PySide6 wheels. Try `PYTHON=python3.12 ./run.sh --update`.
 - **Videos are skipped:** install ffmpeg. Then run `./run.sh doctor` to see the encoders found. Without libx264, MP4 falls back to OpenH264 or MPEG-4.
