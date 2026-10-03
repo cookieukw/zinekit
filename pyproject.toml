@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zinekit"
+version = "1.0.0"
+description = "Punk Zine print for images, videos and titles, with a live-preview editor"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "cookieukw"}]
+requires-python = ">=3.9"
+dependencies = ["Pillow>=9.2"]
+keywords = ["zine", "punk", "halftone", "riso", "xerox", "frei0r", "kdenlive", "ffmpeg"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Multimedia :: Graphics",
+    "Topic :: Multimedia :: Video",
+]
+
+[project.optional-dependencies]
+gui = ["PySide6-Essentials>=6.5"]
+
+[project.scripts]
+zinekit = "zinekit.cli:main"
+
+[project.gui-scripts]
+zinekit-gui = "zinekit.gui.app:main"
+
+[tool.setuptools.packages.find]
+include = ["zinekit*"]
+
+[tool.setuptools.package-data]
+zinekit = ["native/*.c", "native/*.h", "native/README.md", "gui/icon.svg", "locales/*.json"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B"]
+ignore = ["B905"]
+
+[tool.ruff.lint.per-file-ignores]
+"zinekit/i18n.py" = ["E501"]
