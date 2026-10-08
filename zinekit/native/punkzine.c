@@ -18,8 +18,6 @@
  * The print is still (it does not change with time); pair it with a wobble
  * filter such as squigglevision for boil.  Every length scales with the frame
  * size, so a half-resolution preview matches the final render.
- *
- * See README.md in this directory for the parameters and the algorithms.
  */
 #include <math.h>
 #include <stdint.h>
@@ -45,8 +43,9 @@ static int pz_mutex_init(pz_mutex *m) { return pthread_mutex_init(m, NULL) == 0;
 static int pz_mutex_trylock(pz_mutex *m) { return pthread_mutex_trylock(m) == 0; }
 static void pz_mutex_unlock(pz_mutex *m) { pthread_mutex_unlock(m); }
 static void pz_mutex_destroy(pz_mutex *m) { pthread_mutex_destroy(m); }
-static pthread_once_t g_once = PTHREAD_ONCE_INIT;
-static void pz_once(void (*fn)(void)) { pthread_once(&g_once, fn); }
+static pthread_mutex_t g_tables_mu = PTHREAD_MUTEX_INITIALIZER;
+static void pz_tables_lock(void) { pthread_mutex_lock(&g_tables_mu); }
+static void pz_tables_unlock(void) { pthread_mutex_unlock(&g_tables_mu); }
 #else
 /* hosts serialise updates of one instance (MLT locks the service), so a flag is enough */
 typedef int pz_mutex;
@@ -54,8 +53,8 @@ static int pz_mutex_init(pz_mutex *m) { *m = 0; return 1; }
 static int pz_mutex_trylock(pz_mutex *m) { if (*m) return 0; *m = 1; return 1; }
 static void pz_mutex_unlock(pz_mutex *m) { *m = 0; }
 static void pz_mutex_destroy(pz_mutex *m) { (void)m; }
-static int g_once_done = 0;
-static void pz_once(void (*fn)(void)) { if (!g_once_done) { fn(); g_once_done = 1; } }
+static void pz_tables_lock(void) {}
+static void pz_tables_unlock(void) {}
 #endif
 
 #include "frei0r.h"
@@ -67,6 +66,8 @@ enum {
   P_INK, P_PAPER, P_C1, P_C2, P_C3, NPARAM
 };
 #define NCOL 5
+/* text mode gives up (and prints the frame as an element) past this many scrap pixels per frame pixel */
+#define PZ_TEXT_WORK 8
 #define FIRSTCOL P_INK
 
 typedef struct { const char *name; int type; const char *expl; double def; uint32_t rgb; } pdef_t;
@@ -85,14 +86,14 @@ static const pdef_t PDEF[NPARAM] = {
   {"dot_size", F0R_PARAM_DOUBLE, "halftone cell size (element and image)", 0.22, 0},
   {"dot_angle", F0R_PARAM_DOUBLE, "halftone angle, x45 degrees (element and image)", 1, 0},
   {"contrast", F0R_PARAM_DOUBLE, "xerox contrast (element and image)", 0.55, 0},
-  {"grain", F0R_PARAM_DOUBLE, "toner grain and specks", 0.4, 0},
+  {"grain", F0R_PARAM_DOUBLE, "toner grain, specks and photocopier streaks", 0.4, 0},
   {"burn", F0R_PARAM_DOUBLE, "image: burned photocopy edges", 0.35, 0},
-  {"paper_texture", F0R_PARAM_DOUBLE, "paper fibre texture", 0.6, 0},
+  {"paper_texture", F0R_PARAM_DOUBLE, "paper fibre texture and uneven riso ink", 0.6, 0},
   {"misregistration", F0R_PARAM_DOUBLE, "offset of the second (plate) color", 0.4, 0},
   {"shadow", F0R_PARAM_DOUBLE, "hard shadow distance (text and element)", 0.5, 0},
   {"shadow_opacity", F0R_PARAM_DOUBLE, "hard shadow opacity (text and element)", 0.5, 0},
   {"keep_text_color", F0R_PARAM_BOOL, "text: letters keep their own color on contrasting scraps", 0, 0},
-  {"seed", F0R_PARAM_DOUBLE, "layout seed, x1000 (scrap colors and tilts)", 0.001, 0},
+  {"seed", F0R_PARAM_DOUBLE, "random seed, x1000: scrap colors and tilts, grain and texture placement", 0.001, 0},
   {"ink", F0R_PARAM_COLOR, "ink: letters, outlines, halftone dots, shadows", 0, 0x151311},
   {"paper", F0R_PARAM_COLOR, "paper: scraps, cut-out margins, the printed page", 0, 0xF7F3E8},
   {"color1", F0R_PARAM_COLOR, "plate color: the riso second ink (off-register copy, riso plates), also a scrap color", 0, 0xFF4FA8},
@@ -109,12 +110,16 @@ typedef struct {
   /* element cut-out cache: a still PNG only needs its cut and plates once */
   pz_mutex mu; int mu_ok;
   uint64_t ckey; float *cdist, *cpb, *ckeyA, *ccolA; int cstyle, chas;
+  int cbx, cby, cbw, cbh;     /* the cached buffers cover only this box around the element */
 } inst_t;
 
 /* ------------------------------------------------------------------ math helpers */
 static inline float clamp01(float x) { return x < 0.f ? 0.f : (x > 1.f ? 1.f : x); }
 static inline float clampf(float x, float a, float b) { return x < a ? a : (x > b ? b : x); }
 static inline float lerpf(float a, float b, float t) { return a + (b - a) * t; }
+/* plain min/max: fminf/fmaxf are out-of-line library calls unless built with -ffast-math */
+static inline float minf(float a, float b) { return a < b ? a : b; }
+static inline float maxf(float a, float b) { return a > b ? a : b; }
 static inline float smooth(float a, float b, float x) {
   float t = clamp01((x - a) / (b - a));
   return t * t * (3.f - 2.f * t);
@@ -141,43 +146,71 @@ static float *g_noise; /* TEX*TEX*2 displacement field in [-1,1], tileable */
 static float *g_paper; /* TEX*TEX paper luminance factor */
 static float g_cos[CLUT];
 
-static float lat(int x, int y, int px, int py, uint32_t s) {
-  x %= px; if (x < 0) x += px;
-  y %= py; if (y < 0) y += py;
-  return r01((uint32_t)x, (uint32_t)y, s);
+/* tileable value noise over a px*py lattice of random values */
+static float *lattice(int px, int py, uint32_t s) {
+  float *L = (float *)malloc(sizeof(float) * (size_t)px * py);
+  if (L)
+    for (int y = 0; y < py; y++)
+      for (int x = 0; x < px; x++) L[y * px + x] = r01((uint32_t)x, (uint32_t)y, s);
+  return L;
 }
-static float vnoise(float x, float y, int px, int py, uint32_t s) {
+static float vnoise(const float *L, float x, float y, int px, int py) {
   int xi = (int)floorf(x), yi = (int)floorf(y);
   float fx = x - xi, fy = y - yi;
   fx = fx * fx * (3 - 2 * fx); fy = fy * fy * (3 - 2 * fy);
-  float a = lat(xi, yi, px, py, s), b = lat(xi + 1, yi, px, py, s);
-  float c = lat(xi, yi + 1, px, py, s), d = lat(xi + 1, yi + 1, px, py, s);
+  int x0 = xi % px, y0 = yi % py;
+  if (x0 < 0) x0 += px;
+  if (y0 < 0) y0 += py;
+  int x1 = (x0 + 1) % px, y1 = (y0 + 1) % py;
+  float a = L[y0 * px + x0], b = L[y0 * px + x1], c = L[y1 * px + x0], d = L[y1 * px + x1];
   return lerpf(lerpf(a, b, fx), lerpf(c, d, fx), fy);
 }
 
+/* The shared tables live from the first f0r_init() (or f0r_construct(), for hosts that
+   skip it) until the last f0r_deinit() once no instance is left. Guarded by pz_tables_lock. */
+static int g_inits, g_live;
+static int tables_ready(void) { return g_noise && g_paper; }
+static void tables_free(void) {
+  free(g_noise); free(g_paper);
+  g_noise = g_paper = NULL;
+}
 static void init_tables(void) {
+  if (tables_ready()) return;
   for (int i = 0; i < CLUT; i++) g_cos[i] = cosf(6.283185307f * (float)i / CLUT);
+  float *n1L[3], *n2L[3], *loL, *midL, *fibL;
+  int ok = 1;
+  for (int o = 0; o < 3; o++) {
+    n1L[o] = lattice(32 << o, 32 << o, 101 + o);
+    n2L[o] = lattice(32 << o, 32 << o, 201 + o);
+    ok &= n1L[o] && n2L[o];
+  }
+  loL = lattice(6, 6, 301); midL = lattice(40, 40, 302); fibL = lattice(128, 16, 303);
   g_noise = (float *)malloc(sizeof(float) * TEX * TEX * 2);
   g_paper = (float *)malloc(sizeof(float) * TEX * TEX);
-  if (!g_noise || !g_paper) return;
-  for (int y = 0; y < TEX; y++)
-    for (int x = 0; x < TEX; x++) {
-      float n1 = 0, n2 = 0, tot = 0, amp = 1;
-      for (int o = 0; o < 3; o++) {
-        int per = 32 << o;
-        float s = (float)per / TEX;
-        n1 += amp * vnoise(x * s, y * s, per, per, 101 + o);
-        n2 += amp * vnoise(x * s, y * s, per, per, 201 + o);
-        tot += amp; amp *= 0.6f;
+  ok &= loL && midL && fibL && g_noise && g_paper;
+  if (ok)
+    for (int y = 0; y < TEX; y++)
+      for (int x = 0; x < TEX; x++) {
+        float n1 = 0, n2 = 0, tot = 0, amp = 1;
+        for (int o = 0; o < 3; o++) {
+          int per = 32 << o;
+          float s = (float)per / TEX;
+          n1 += amp * vnoise(n1L[o], x * s, y * s, per, per);
+          n2 += amp * vnoise(n2L[o], x * s, y * s, per, per);
+          tot += amp; amp *= 0.6f;
+        }
+        g_noise[2 * (y * TEX + x)] = clampf((n1 / tot - 0.5f) * 3.2f, -1, 1);
+        g_noise[2 * (y * TEX + x) + 1] = clampf((n2 / tot - 0.5f) * 3.2f, -1, 1);
+        float lo = vnoise(loL, x * 6.f / TEX, y * 6.f / TEX, 6, 6);
+        float mid = vnoise(midL, x * 40.f / TEX, y * 40.f / TEX, 40, 40);
+        float fib = vnoise(fibL, x * 128.f / TEX, y * 16.f / TEX, 128, 16);
+        float gr = r01((uint32_t)x, (uint32_t)y, 304);
+        g_paper[y * TEX + x] = 1.03f - 0.075f * lo - 0.05f * mid - 0.04f * fib - 0.06f * gr * gr;
       }
-      g_noise[2 * (y * TEX + x)] = clampf((n1 / tot - 0.5f) * 3.2f, -1, 1);
-      g_noise[2 * (y * TEX + x) + 1] = clampf((n2 / tot - 0.5f) * 3.2f, -1, 1);
-      float lo = vnoise(x * 6.f / TEX, y * 6.f / TEX, 6, 6, 301);
-      float mid = vnoise(x * 40.f / TEX, y * 40.f / TEX, 40, 40, 302);
-      float fib = vnoise(x * 128.f / TEX, y * 16.f / TEX, 128, 16, 303);
-      float gr = r01((uint32_t)x, (uint32_t)y, 304);
-      g_paper[y * TEX + x] = 1.03f - 0.075f * lo - 0.05f * mid - 0.04f * fib - 0.06f * gr * gr;
-    }
+  else
+    tables_free();
+  for (int o = 0; o < 3; o++) { free(n1L[o]); free(n2L[o]); }
+  free(loL); free(midL); free(fibL);
 }
 
 static inline void tex_disp(float u, float v, float *dx, float *dy) {
@@ -223,24 +256,37 @@ typedef struct { rowfn fn; void *ctx; int y0, y1; } job_t;
 #if PZ_THREADS
 static void *job_run(void *a) { job_t *j = (job_t *)a; j->fn(j->ctx, j->y0, j->y1); return NULL; }
 #endif
-static void par_rows(rowfn fn, void *ctx, int y0, int y1, long work) {
+/* row bands, one thread per online CPU (max 8), created per call; serial for small work.
+   roww (optional, one entry per row from y0) balances the bands by work instead of by row count. */
+static void par_rows_w(rowfn fn, void *ctx, int y0, int y1, int64_t work, const int64_t *roww) {
 #if PZ_THREADS
-  /* row bands, one thread per online CPU (max 8), created per call; serial for small work */
-  long nt = sysconf(_SC_NPROCESSORS_ONLN);
+  int64_t nt = sysconf(_SC_NPROCESSORS_ONLN);
   if (nt < 1) nt = 1;
   if (nt > 8) nt = 8;
   if (work < 120000 || nt == 1 || y1 - y0 < 16) { fn(ctx, y0, y1); return; }
   pthread_t th[8]; job_t jobs[8]; int ok[8] = {0};
   int n = y1 - y0;
-  for (int i = 0; i < nt; i++) { jobs[i].fn = fn; jobs[i].ctx = ctx; jobs[i].y0 = y0 + (int)((long)n * i / nt); jobs[i].y1 = y0 + (int)((long)n * (i + 1) / nt); }
+  for (int i = 0; i < nt; i++) { jobs[i].fn = fn; jobs[i].ctx = ctx; jobs[i].y0 = y0 + (int)((int64_t)n * i / nt); jobs[i].y1 = y0 + (int)((int64_t)n * (i + 1) / nt); }
+  if (roww) {
+    int64_t tot = 0;
+    for (int y = 0; y < n; y++) tot += roww[y];
+    int64_t run = 0; int b = 1;
+    for (int y = 0; y < n && b < nt; y++) {
+      run += roww[y];
+      while (b < nt && run * nt >= tot * b) { jobs[b - 1].y1 = jobs[b].y0 = y0 + y + 1; b++; }
+    }
+    for (; b < nt; b++) jobs[b - 1].y1 = jobs[b].y0 = y1;
+    jobs[nt - 1].y1 = y1;
+  }
   for (int i = 1; i < nt; i++) ok[i] = pthread_create(&th[i], NULL, job_run, &jobs[i]) == 0;
   job_run(&jobs[0]);
   for (int i = 1; i < nt; i++) { if (ok[i]) pthread_join(th[i], NULL); else job_run(&jobs[i]); }
 #else
-  (void)work;
+  (void)work; (void)roww;
   fn(ctx, y0, y1);
 #endif
 }
+static void par_rows(rowfn fn, void *ctx, int y0, int y1, int64_t work) { par_rows_w(fn, ctx, y0, y1, work, NULL); }
 
 /* ------------------------------------------------------------------ per-frame context */
 typedef struct {
@@ -264,6 +310,11 @@ typedef struct {
   float accY[3]; float accCo[3], accCg[3]; float gain;
   float cell, ang;
   int estyle; rgbf plate; const float *keyA; const float *colA; int underplate;
+  int bx, by, bw, bh;        /* box of the element buffers (dist, pb, keyA, colA) */
+  int rx0, ry0, rx1, ry1;    /* output pixels the element can touch; the rest is transparent */
+  const int *zord;           /* text: groups in drawing order */
+  int ax0, ay0, aw, ah;      /* text: box of the accumulator (union of every scrap) */
+  uint64_t fhash;            /* hash of the input frame */
   /* image */
   int style; float wob, jit; float lv_lo, lv_inv; float tmx, tmy;
 } ctx_t;
@@ -303,6 +354,17 @@ static inline void sample(const ctx_t *c, float x, float y, int clamp, float out
   int x0 = (int)fx, y0 = (int)fy;
   float tx = x - fx, ty = y - fy;
   float acc[4] = {0, 0, 0, 0};
+  if (x0 >= 0 && y0 >= 0 && x0 < w - 1 && y0 < h - 1) { /* interior: no bounds checks */
+    const uint8_t *p = c->src + 4 * ((size_t)y0 * w + x0);
+    const uint8_t *q[4] = {p, p + 4, p + 4 * (size_t)w, p + 4 * (size_t)w + 4};
+    float wt[4] = {(1 - tx) * (1 - ty), tx * (1 - ty), (1 - tx) * ty, tx * ty};
+    for (int j = 0; j < 4; j++) {
+      float wa = wt[j] * q[j][3] * (1.f / 255.f), s = wa * (1.f / 255.f);
+      acc[0] += s * q[j][0]; acc[1] += s * q[j][1]; acc[2] += s * q[j][2]; acc[3] += wa;
+    }
+    memcpy(out, acc, sizeof(acc));
+    return;
+  }
   for (int j = 0; j < 4; j++) {
     int xi = x0 + (j & 1), yi = y0 + (j >> 1);
     float wgt = ((j & 1) ? tx : 1 - tx) * ((j >> 1) ? ty : 1 - ty);
@@ -339,6 +401,10 @@ static inline float samplef_far(const float *buf, int w, int h, float x, float y
   return v;
 }
 
+/* element buffers live in the box (bx, by, bw, bh); sample them in frame coordinates */
+static inline float bsamp(const ctx_t *c, const float *buf, float x, float y) { return samplef(buf, c->bw, c->bh, x - c->bx, y - c->by); }
+static inline float bsamp_far(const ctx_t *c, const float *buf, float x, float y, float far) { return samplef_far(buf, c->bw, c->bh, x - c->bx, y - c->by, far); }
+
 /* premultiplied "over" into a float RGBA pixel */
 static inline void over(float *d, rgbf c, float a) {
   if (a <= 0.f) return;
@@ -365,12 +431,31 @@ static inline void store(const ctx_t *c, size_t i, const float *e) {
   d[3] = (uint8_t)(clamp01(o[3]) * 255.f + 0.5f);
 }
 
+/* riso drums never ink evenly: soft blotches where the plate prints lighter (stronger with paper texture) */
+static inline float ink_mottle(const ctx_t *c, float x, float y, int plate) {
+  if (c->paper_tex <= 0.f) return 1.f;
+  float a, b;
+  tex_disp(x * c->invk * 0.07f + 400.f + 150.f * plate, y * c->invk * 0.07f + 50.f + 90.f * plate, &a, &b);
+  float m = clamp01(0.5f + 0.6f * a + 0.25f * b);
+  return 1.f - 0.3f * c->paper_tex * m * m;
+}
+/* photocopier drum: thin dark toner lines across the page, sparse (stronger with grain) */
+static inline float xerox_streak(const ctx_t *c, float y) {
+  if (c->grain <= 0.f) return 0.f;
+  float a, b, d, e;
+  tex_disp(17.f + c->ox, y * c->invk * 0.8f + c->oy, &a, &b);
+  tex_disp(301.f, y * c->invk * 0.05f + 7.f, &d, &e);
+  float line = clamp01(a * 1.4f - 0.55f), band = clamp01(0.4f + 0.8f * d);
+  return c->grain * 0.32f * line * line * band;
+}
+
 /* ================================================================== IMAGE: xerox / riso */
 static void image_rows(void *vc, int y0, int y1) {
   ctx_t *c = (ctx_t *)vc;
   int w = c->w, h = c->h;
   float bw = 0.2f * (float)(w < h ? w : h);
-  for (int y = y0; y < y1; y++)
+  for (int y = y0; y < y1; y++) {
+    float streak = xerox_streak(c, (float)y);
     for (int x = 0; x < w; x++) {
       float dx = 0, dy = 0;
       if (c->wob > 0) { tex_disp(x * c->invk * 0.25f + c->ox, y * c->invk * 0.25f + c->oy, &dx, &dy); dx *= c->wob; dy *= c->wob; }
@@ -384,7 +469,7 @@ static void image_rows(void *vc, int y0, int y1) {
       float Yc = contrast(c, Y);
       /* burned edges */
       if (c->burn > 0) {
-        float e = fminf(fminf((float)x, (float)(w - 1 - x)), fminf((float)y, (float)(h - 1 - y))) / bw;
+        float e = minf(minf((float)x, (float)(w - 1 - x)), minf((float)y, (float)(h - 1 - y))) / bw;
         float n0, n1;
         tex_disp(x * c->invk * 0.12f + 300.f + c->ox * 0.2f, y * c->invk * 0.12f + c->oy * 0.2f, &n0, &n1);
         float bf = c->burn * (1.f - smooth(0.f, 1.f, e * (0.75f + 0.5f * n0)));
@@ -398,7 +483,7 @@ static void image_rows(void *vc, int y0, int y1) {
       switch (c->style) {
         default:
         case 0: { /* xerox halftone */
-          float amt = speck ? 1.f : screen(&c->s_k, hx, hy, 1.f - Yc);
+          float amt = speck ? 1.f : screen(&c->s_k, hx, hy, clamp01(1.f - Yc + streak));
           out = mixc(pap, c->ink, amt);
           break;
         }
@@ -408,7 +493,7 @@ static void image_rows(void *vc, int y0, int y1) {
           float Yc2 = contrast(c, Y2 + gn);
           float covA = clamp01((1.f - Yc2) * 1.1f);
           float covK = smooth(0.42f, 0.02f, Yc);
-          float amtA = screen(&c->s_a, hx, hy, covA);
+          float amtA = screen(&c->s_a, hx, hy, covA) * ink_mottle(c, (float)x, (float)y, 0);
           float amtK = speck ? 1.f : screen(&c->s_k, hx, hy, covK);
           rgbf one = {1, 1, 1};
           out = mulc(mulc(pap, mixc(one, c->plate, amtA)), mixc(one, c->ink, amtK));
@@ -422,15 +507,15 @@ static void image_rows(void *vc, int y0, int y1) {
           float w1 = clamp01(0.55f + 1.3f * (r - g) + 0.4f * (b - g));
           float w2 = clamp01(0.55f + 1.3f * (g2 - r2) + 0.3f * (g2 - b2));
           float cov1 = clamp01(d1 * (w1 + 0.5f * d1)), cov2 = clamp01(d2 * (w2 + 0.5f * d2));
-          float amt1 = screen(&c->s_a, hx, hy, cov1);
-          float amt2 = screen(&c->s_b, hx, hy, cov2);
+          float amt1 = screen(&c->s_a, hx, hy, cov1) * ink_mottle(c, (float)x, (float)y, 0);
+          float amt2 = screen(&c->s_b, hx, hy, cov2) * ink_mottle(c, (float)x, (float)y, 1);
           rgbf one = {1, 1, 1};
           out = mulc(mulc(pap, mixc(one, c->c1, amt1)), mixc(one, c->c2, amt2));
           if (speck) out = c->ink;
           break;
         }
         case 3: { /* flat photocopy: hard threshold with toner noise */
-          float t = 1.f - Yc + (r01((uint32_t)x, (uint32_t)y, c->step * 31u + c->seed + 9u) - 0.5f) * (0.06f + 0.2f * c->grain);
+          float t = 1.f - Yc + streak * 2.f + (r01((uint32_t)x, (uint32_t)y, c->step * 31u + c->seed + 9u) - 0.5f) * (0.06f + 0.2f * c->grain);
           float amt = speck ? 1.f : smooth(0.47f, 0.53f, t);
           out = mixc(pap, c->ink, amt);
           break;
@@ -439,6 +524,7 @@ static void image_rows(void *vc, int y0, int y1) {
       float e[4] = {out.r * a, out.g * a, out.b * a, a};
       store(c, (size_t)y * w + x, e);
     }
+  }
 }
 
 /* ================================================================== connected components */
@@ -498,7 +584,7 @@ static int ccl(const uint8_t *m, int w, int h, int *lab) {
 
 /* ================================================================== TEXT: ransom-note scraps */
 typedef struct grp_s {
-  int x0, y0, x1, y1; long area;
+  int x0, y0, x1, y1; int64_t area;
   float cx, cy;
   int order;
   float rc, rs, sc, tx, ty;   /* forward transform about (cx,cy) */
@@ -511,13 +597,8 @@ typedef struct grp_s {
   int ox0, oy0, ox1, oy1;     /* output bbox */
 } grp_t;
 
-typedef struct { int x0, y0, x1, y1; long area; } comp_t;
+typedef struct { int x0, y0, x1, y1; int64_t area; } comp_t;
 
-static const comp_t *g_sort_comps;
-static int cmp_comp_x(const void *a, const void *b) {
-  const comp_t *A = &g_sort_comps[*(const int *)a], *B = &g_sort_comps[*(const int *)b];
-  return A->x0 - B->x0;
-}
 typedef struct { float key; int idx; } keyidx_t;
 static int cmp_key(const void *a, const void *b) {
   float d = ((const keyidx_t *)a)->key - ((const keyidx_t *)b)->key;
@@ -553,27 +634,24 @@ static inline float glyph_alpha(const ctx_t *c, int gi, float px, float py) {
   return v;
 }
 
-typedef struct { ctx_t *c; int gi; } gjob_t;
-static void group_rows(void *vj, int y0, int y1) {
-  gjob_t *j = (gjob_t *)vj;
-  ctx_t *c = j->c;
-  const grp_t *g = &c->groups[j->gi];
+static void group_span(ctx_t *c, int gi, int y0, int y1) {
+  const grp_t *g = &c->groups[gi];
   rgbf sh = scalec(c->ink, 0.6f);
   for (int y = y0; y < y1; y++)
     for (int x = g->ox0; x < g->ox1; x++) {
       float nx = 0, ny = 0;
       if (c->amp > 0) rough_disp(c, (float)x, (float)y, &nx, &ny);
       float dx = nx * c->amp, dy = ny * c->amp, ex = nx * c->amp_edge, ey = ny * c->amp_edge;
-      float *d = c->acc + 4 * ((size_t)y * c->w + x);
+      float *d = c->acc + 4 * ((size_t)(y - c->ay0) * c->aw + (x - c->ax0));
       /* shadow */
       if (c->shop > 0) {
         float sx, sy;
-        if (g->nopaper) { inv_map(g, x - c->shx + dx, y - c->shy + dy, &sx, &sy); float cs = smooth(0.2f, 0.8f, glyph_alpha(c, j->gi, sx, sy)); if (cs > 0) over(d, sh, cs * c->shop); }
+        if (g->nopaper) { inv_map(g, x - c->shx + dx, y - c->shy + dy, &sx, &sy); float cs = smooth(0.2f, 0.8f, glyph_alpha(c, gi, sx, sy)); if (cs > 0) over(d, sh, cs * c->shop); }
         else { inv_map(g, x - c->shx + ex, y - c->shy + ey, &sx, &sy); float cs = quad_cov(g, sx, sy); if (cs > 0) over(d, sh, cs * c->shop); }
       }
       float px, py, qx, qy;
       inv_map(g, x + dx, y + dy, &px, &py);
-      float ga = smooth(0.2f, 0.8f, glyph_alpha(c, j->gi, px, py));
+      float ga = smooth(0.2f, 0.8f, glyph_alpha(c, gi, px, py));
       rgbf fg = g->fg;
       float knock = 0.f;
       if (ga > 0 && !g->nopaper && (c->keepcol || g->multi)) {
@@ -588,7 +666,7 @@ static void group_rows(void *vj, int y0, int y1) {
         if (c->tmx != 0 || c->tmy != 0) {
           float mx, my;
           inv_map(g, x - c->tmx + dx, y - c->tmy + dy, &mx, &my);
-          float gm = smooth(0.2f, 0.8f, glyph_alpha(c, j->gi, mx, my));
+          float gm = smooth(0.2f, 0.8f, glyph_alpha(c, gi, mx, my));
           if (gm > 0) over(d, c->plate, gm);
         }
         if (ga > 0) {
@@ -604,7 +682,7 @@ static void group_rows(void *vj, int y0, int y1) {
           if (g->ghost) { /* second riso plate printing the letter off register */
             float mx, my;
             inv_map(g, x - c->tmx + dx, y - c->tmy + dy, &mx, &my);
-            float gm = smooth(0.2f, 0.8f, glyph_alpha(c, j->gi, mx, my));
+            float gm = smooth(0.2f, 0.8f, glyph_alpha(c, gi, mx, my));
             if (gm > 0) bg = mulc(bg, mixc(mkrgb(1, 1, 1), c->plate, gm));
           }
           rgbf col = mixc(bg, fg, ga * (1.f - knock));
@@ -612,6 +690,27 @@ static void group_rows(void *vj, int y0, int y1) {
         }
       }
     }
+}
+/* one band of rows: every letter that crosses it, in z order (pixels never depend on other rows) */
+static void text_rows(void *vc, int y0, int y1) {
+  ctx_t *c = (ctx_t *)vc;
+  for (int i = 0; i < c->ng; i++) {
+    const grp_t *G = &c->groups[c->zord[i]];
+    int a = G->oy0 > y0 ? G->oy0 : y0, b = G->oy1 < y1 ? G->oy1 : y1;
+    if (a < b && G->ox1 > G->ox0) group_span(c, c->zord[i], a, b);
+  }
+}
+static void acc_rows(void *vc, int y0, int y1) {
+  ctx_t *c = (ctx_t *)vc;
+  static const float zero[4] = {0, 0, 0, 0};
+  for (int y = y0; y < y1; y++) {
+    int iny = y >= c->ay0 && y < c->ay0 + c->ah;
+    for (int x = 0; x < c->w; x++) {
+      size_t i = (size_t)y * c->w + x;
+      if (iny && x >= c->ax0 && x < c->ax0 + c->aw) store(c, i, c->acc + 4 * ((size_t)(y - c->ay0) * c->aw + (x - c->ax0)));
+      else store(c, i, zero); /* no scrap reaches this pixel */
+    }
+  }
 }
 
 static void pick_scrap(const ctx_t *c, int pal, uint32_t key, rgbf *bg, rgbf *fg, int *nopaper, float ytext) {
@@ -663,6 +762,7 @@ static int run_text(ctx_t *c, int force) {
   uint8_t *m = (uint8_t *)malloc(N);
   int *lab = (int *)malloc(sizeof(int) * N);
   comp_t *comps = NULL; int *gpar = NULL, *c2g = NULL, *ord = NULL; grp_t *groups = NULL; float *acc = NULL; keyidx_t *keys = NULL;
+  int *zord = NULL; int64_t *roww = NULL;
   if (!m || !lab) goto done;
   for (size_t i = 0; i < N; i++) m[i] = c->src[4 * i + 3] >= 128;
   int nc = ccl(m, w, h, lab);
@@ -700,17 +800,25 @@ static int run_text(ctx_t *c, int force) {
       int l = lab[(size_t)y * w + x];
       if (!l) continue;
       comp_t *cp = &comps[l];
-      if (x < cp->x0) cp->x0 = x; if (x > cp->x1) cp->x1 = x;
-      if (y < cp->y0) cp->y0 = y; if (y > cp->y1) cp->y1 = y;
+      if (x < cp->x0) cp->x0 = x;
+      if (x > cp->x1) cp->x1 = x;
+      if (y < cp->y0) cp->y0 = y;
+      if (y > cp->y1) cp->y1 = y;
       cp->area++;
     }
-  long minarea = (long)fmaxf(3.f, 3.f * c->k * c->k);
+  int64_t minarea = (int64_t)maxf(3.f, 3.f * c->k * c->k);
   int nv = 0;
   for (int l = 1; l <= nc; l++) if (comps[l].area >= minarea) ord[nv++] = l;
   if (!nv) goto done;
   /* merge dots / accents / split glyphs into one letter */
-  g_sort_comps = comps;
-  qsort(ord, nv, sizeof(int), cmp_comp_x);
+  { /* sort by left edge (no global comparator state: several instances may run at once) */
+    keyidx_t *kx = (keyidx_t *)malloc(sizeof(keyidx_t) * nv);
+    if (!kx) goto done;
+    for (int a = 0; a < nv; a++) { kx[a].key = (float)comps[ord[a]].x0; kx[a].idx = ord[a]; }
+    qsort(kx, nv, sizeof(keyidx_t), cmp_key);
+    for (int a = 0; a < nv; a++) ord[a] = kx[a].idx;
+    free(kx);
+  }
   for (int a = 0; a < nv; a++) {
     const comp_t *A = &comps[ord[a]];
     for (int b = a + 1; b < nv; b++) {
@@ -728,15 +836,18 @@ static int run_text(ctx_t *c, int force) {
   int ng = 0;
   for (int a = 0; a < nv; a++) { int r = uf_find(gpar, ord[a]); if (c2g[r] < 0) c2g[r] = ng++; }
   for (int a = 0; a < nv; a++) c2g[ord[a]] = c2g[uf_find(gpar, ord[a])];
-  groups = (grp_t *)calloc(ng, sizeof(grp_t));
+  if (ng <= 0) goto done;
+  groups = (grp_t *)calloc((size_t)ng, sizeof(grp_t));
   if (!groups) goto done;
   for (int g = 0; g < ng; g++) { groups[g].x0 = w; groups[g].y0 = h; groups[g].x1 = -1; groups[g].y1 = -1; }
-  long total = 0, maxa = 0;
+  int64_t total = 0, maxa = 0;
   for (int a = 0; a < nv; a++) {
     const comp_t *A = &comps[ord[a]];
     grp_t *g = &groups[c2g[ord[a]]];
-    if (A->x0 < g->x0) g->x0 = A->x0; if (A->x1 > g->x1) g->x1 = A->x1;
-    if (A->y0 < g->y0) g->y0 = A->y0; if (A->y1 > g->y1) g->y1 = A->y1;
+    if (A->x0 < g->x0) g->x0 = A->x0;
+    if (A->x1 > g->x1) g->x1 = A->x1;
+    if (A->y0 < g->y0) g->y0 = A->y0;
+    if (A->y1 > g->y1) g->y1 = A->y1;
     g->area += A->area; total += A->area;
   }
   for (int g = 0; g < ng; g++) if (groups[g].area > maxa) maxa = groups[g].area;
@@ -826,7 +937,10 @@ static int run_text(ctx_t *c, int force) {
       float sy = G->nopaper ? (i & 2 ? G->y1 + 1 : G->y0) : G->qy[i];
       float ux = (sx - G->cx) * G->sc, uy = (sy - G->cy) * G->sc;
       float X = G->cx + G->tx + ux * G->rc - uy * G->rs, Y = G->cy + G->ty + ux * G->rs + uy * G->rc;
-      if (X < mnx) mnx = X; if (X > mxx) mxx = X; if (Y < mny) mny = Y; if (Y > mxy) mxy = Y;
+      if (X < mnx) mnx = X;
+      if (X > mxx) mxx = X;
+      if (Y < mny) mny = Y;
+      if (Y > mxy) mxy = Y;
     }
     float mg = c->amp + c->amp_edge + 3.f + fabsf(c->tmx) + fabsf(c->tmy);
     mnx -= mg; mny -= mg; mxx += mg + c->shx; mxy += mg + c->shy;
@@ -836,22 +950,50 @@ static int run_text(ctx_t *c, int force) {
     if (G->oy1 > h) G->oy1 = h;
   }
 
-  acc = (float *)calloc(N * 4, sizeof(float));
-  if (!acc) goto done;
+  /* work = pixels visited over all scraps; the accumulator only covers their union */
+  int64_t work = 0;
+  int ux0 = w, uy0 = h, ux1 = 0, uy1 = 0;
+  for (int g = 0; g < ng; g++) {
+    const grp_t *G = &groups[g];
+    if (G->ox1 <= G->ox0 || G->oy1 <= G->oy0) continue;
+    work += (int64_t)(G->ox1 - G->ox0) * (G->oy1 - G->oy0);
+    if (G->ox0 < ux0) ux0 = G->ox0;
+    if (G->oy0 < uy0) uy0 = G->oy0;
+    if (G->ox1 > ux1) ux1 = G->ox1;
+    if (G->oy1 > uy1) uy1 = G->oy1;
+  }
+  /* barcodes, dithered alpha and the like: thousands of tall or tiny overlapping scraps would take
+     seconds per frame, so those go to the element cut-out instead (also when text is forced) */
+  if (work > PZ_TEXT_WORK * (int64_t)N) goto done;
+  if (ux1 <= ux0 || uy1 <= uy0) { ux0 = uy0 = 0; ux1 = uy1 = 0; }
+  c->ax0 = ux0; c->ay0 = uy0; c->aw = ux1 - ux0; c->ah = uy1 - uy0;
+  if (c->aw > 0) {
+    acc = (float *)calloc((size_t)c->aw * c->ah * 4, sizeof(float));
+    if (!acc) goto done;
+  }
   c->lab = lab; c->c2g = c2g; c->groups = groups; c->ng = ng; c->acc = acc;
   /* draw in z order */
   for (int g = 0; g < ng; g++) { keys[g].key = groups[g].z; keys[g].idx = g; }
   qsort(keys, ng, sizeof(keyidx_t), cmp_key);
+  zord = (int *)malloc(sizeof(int) * ng);
+  roww = (int64_t *)calloc((size_t)h + 1, sizeof(int64_t));
+  if (!zord || !roww) goto done;
   for (int i = 0; i < ng; i++) {
-    grp_t *G = &groups[keys[i].idx];
+    const grp_t *G = &groups[keys[i].idx];
+    zord[i] = keys[i].idx;
     if (G->ox1 <= G->ox0 || G->oy1 <= G->oy0) continue;
-    gjob_t j = {c, keys[i].idx};
-    par_rows(group_rows, &j, G->oy0, G->oy1, (long)(G->ox1 - G->ox0) * (G->oy1 - G->oy0));
+    int64_t wd = G->ox1 - G->ox0;
+    roww[G->oy0] += wd; roww[G->oy1] -= wd;
   }
-  for (size_t i = 0; i < N; i++) store(c, i, acc + 4 * i);
+  for (int64_t y = 0, run = 0; y < h; y++) { run += roww[y]; roww[y] = run + 1; }
+  c->zord = zord;
+  /* all letters in one parallel pass, bands balanced by how much text crosses each row */
+  par_rows_w(text_rows, c, 0, h, work, roww);
+  par_rows(acc_rows, c, 0, h, (int64_t)N);
   ok = 1;
 done:
   free(m); free(lab); free(comps); free(gpar); free(c2g); free(ord); free(groups); free(acc); free(keys);
+  free(zord); free(roww);
   return ok;
 }
 
@@ -878,7 +1020,7 @@ static void edt1d(const double *f, int n, double *d, int *v, double *z) {
 }
 static int edt(const uint8_t *mask, int w, int h, float *out) {
   int n = w > h ? w : h;
-  double *f = (double *)malloc(sizeof(double) * n), *d = (double *)malloc(sizeof(double) * n), *z = (double *)malloc(sizeof(double) * (n + 1));
+  double *f = (double *)calloc((size_t)n, sizeof(double)), *d = (double *)malloc(sizeof(double) * n), *z = (double *)malloc(sizeof(double) * (n + 1));
   int *v = (int *)malloc(sizeof(int) * n);
   double *tmp = (double *)malloc(sizeof(double) * (size_t)w * h);
   if (!f || !d || !z || !v || !tmp) { free(f); free(d); free(z); free(v); free(tmp); return 0; }
@@ -903,16 +1045,19 @@ static inline int dir_of(int dx, int dy) {
   for (int i = 0; i < 8; i++) if (MDX[i] == dx && MDY[i] == dy) return i;
   return 0;
 }
-/* Moore-neighbour tracing of the outer boundary of the component containing (sx,sy), the first pixel in raster order. */
+/* Moore-neighbour tracing of the outer boundary of the component containing (sx,sy), the first pixel
+   in raster order. Returns the number of points, or -1 when the point buffer cannot grow. */
 static int trace(const int *lab, int l, int w, int h, int sx, int sy, float **pts, int *cap) {
   int n = 0, px = sx, py = sy, bdir = 0, first = -1;
-  long maxit = 4L * ((long)w + h) * 8 + 100000;
-  for (long it = 0; it < maxit; it++) {
+  /* a pixel is entered only a few times, so this bound only guards a broken invariant */
+  int64_t maxit = 8 * (int64_t)w * h + 16;
+  for (int64_t it = 0; it < maxit; it++) {
     if (n + 1 >= *cap) {
-      *cap *= 2;
-      float *np = (float *)realloc(*pts, sizeof(float) * 2 * (*cap));
-      if (!np) return n;
-      *pts = np;
+      if (*cap > (1 << 28)) return -1;
+      int ncap = *cap * 2; /* the capacity only changes once the bigger buffer exists */
+      float *np = (float *)realloc(*pts, sizeof(float) * 2 * (size_t)ncap);
+      if (!np) return -1;
+      *pts = np; *cap = ncap;
     }
     (*pts)[2 * n] = (float)px; (*pts)[2 * n + 1] = (float)py; n++;
     int found = -1;
@@ -957,42 +1102,59 @@ static void rdp(const float *p, int a, int b, float eps, uint8_t *keep, int *sta
 }
 typedef struct { float x0, y0, x1, y1; int dir; } edge_t;
 typedef struct { float x; int dir; } isect_t;
+static inline float edge_lo(const edge_t *e) { return e->y0 < e->y1 ? e->y0 : e->y1; }
+static inline float edge_hi(const edge_t *e) { return e->y0 < e->y1 ? e->y1 : e->y0; }
 static int cmp_isect(const void *a, const void *b) {
   float d = ((const isect_t *)a)->x - ((const isect_t *)b)->x;
   return d < 0 ? -1 : (d > 0 ? 1 : 0);
 }
-/* non-zero winding fill of all edges, 4 sub-scanlines per row, exact horizontal coverage */
-static void raster(const edge_t *E, int ne, int w, int h, float *cov) {
-  isect_t *is = (isect_t *)malloc(sizeof(isect_t) * (ne + 2));
-  if (!is) return;
+static int cmp_edge_lo(const void *a, const void *b) {
+  float d = edge_lo((const edge_t *)a) - edge_lo((const edge_t *)b);
+  return d < 0 ? -1 : (d > 0 ? 1 : 0);
+}
+/* non-zero winding fill of all edges, 4 sub-scanlines per row, exact horizontal coverage.
+   Edges are sorted by their top, and each sub-scanline only looks at the edges crossing it.
+   Returns 0 on allocation failure (nothing is drawn). */
+static int raster(edge_t *E, int ne, int w, int h, float *cov) {
+  isect_t *is = (isect_t *)malloc(sizeof(isect_t) * ((size_t)ne + 2));
+  int *act = (int *)malloc(sizeof(int) * ((size_t)ne + 1));
+  if (!is || !act) { free(is); free(act); return 0; }
+  qsort(E, (size_t)ne, sizeof(edge_t), cmp_edge_lo);
   float ymin = 1e9f, ymax = -1e9f;
   for (int i = 0; i < ne; i++) {
-    float a = fminf(E[i].y0, E[i].y1), b = fmaxf(E[i].y0, E[i].y1);
-    if (a < ymin) ymin = a; if (b > ymax) ymax = b;
+    float a = edge_lo(&E[i]), b = edge_hi(&E[i]);
+    if (a < ymin) ymin = a;
+    if (b > ymax) ymax = b;
   }
   int ya = (int)floorf(ymin) - 1, yb = (int)ceilf(ymax) + 1;
-  if (ya < 0) ya = 0; if (yb > h) yb = h;
+  if (ya < 0) ya = 0;
+  if (yb > h) yb = h;
+  int next = 0, na = 0;
   for (int y = ya; y < yb; y++) {
     float *row = cov + (size_t)y * w;
     for (int s = 0; s < 4; s++) {
       float sy = y - 0.5f + (s + 0.5f) * 0.25f;
+      /* active edges: top <= sy < bottom */
+      while (next < ne && edge_lo(&E[next]) <= sy) act[na++] = next++;
+      int k = 0;
+      for (int i = 0; i < na; i++) if (sy < edge_hi(&E[act[i]])) act[k++] = act[i];
+      na = k;
       int n = 0;
-      for (int i = 0; i < ne; i++) {
-        const edge_t *e = &E[i];
-        float lo = e->y0 < e->y1 ? e->y0 : e->y1, hi = e->y0 < e->y1 ? e->y1 : e->y0;
-        if (sy < lo || sy >= hi) continue;
+      for (int i = 0; i < na; i++) {
+        const edge_t *e = &E[act[i]];
         is[n].x = e->x0 + (sy - e->y0) * (e->x1 - e->x0) / (e->y1 - e->y0);
         is[n].dir = e->dir; n++;
       }
       if (n < 2) continue;
-      qsort(is, n, sizeof(isect_t), cmp_isect);
+      qsort(is, (size_t)n, sizeof(isect_t), cmp_isect);
       int wind = 0;
       for (int i = 0; i < n - 1; i++) {
         wind += is[i].dir;
         if (!wind) continue;
         float xa = is[i].x + 0.5f, xb = is[i + 1].x + 0.5f; /* pixel x covers [x, x+1) after shift */
         if (xb <= xa) continue;
-        if (xa < 0) xa = 0; if (xb > w) xb = (float)w;
+        if (xa < 0) xa = 0;
+        if (xb > w) xb = (float)w;
         int ia = (int)xa, ib = (int)xb;
         if (ia >= w || xb <= 0) continue;
         if (ia == ib) { row[ia] += (xb - xa) * 0.25f; continue; }
@@ -1002,37 +1164,58 @@ static void raster(const edge_t *E, int ne, int w, int h, float *cov) {
       }
     }
   }
-  free(is);
+  free(is); free(act);
+  return 1;
 }
 
-/* scissor-cut backing: dilate, trace each piece, simplify into straight cuts, fill */
+/* scissor-cut backing: dilate, trace each piece, simplify into straight cuts, fill.
+   On allocation failure the backing is left empty. */
 static void build_backing(ctx_t *c, const float *dist, float R, float *pb) {
-  int w = c->w, h = c->h;
+  int w = c->bw, h = c->bh; /* box coordinates */
   size_t N = (size_t)w * h;
-  uint8_t *mb = (uint8_t *)malloc(N);
-  int *lab = (int *)malloc(sizeof(int) * N);
-  float *pts = NULL; uint8_t *keep = NULL; int *stack = NULL; edge_t *E = NULL;
+  uint8_t *mb = (uint8_t *)malloc(N), *seen = NULL, *keep = NULL;
+  int *lab = (int *)malloc(sizeof(int) * N), *stack = NULL;
+  float *pts = NULL, *poly = NULL;
+  edge_t *E = NULL;
+  int cap = 4096, ecap = 1024, kcap = 0, ne = 0;
   if (!mb || !lab) goto out;
   for (size_t i = 0; i < N; i++) mb[i] = dist[i] <= R;
   int nl = ccl(mb, w, h, lab);
   if (nl <= 0) goto out;
-  int cap = 4096, ecap = 1024, ne = 0;
   pts = (float *)malloc(sizeof(float) * 2 * cap);
   E = (edge_t *)malloc(sizeof(edge_t) * ecap);
-  uint8_t *seen = (uint8_t *)calloc(nl + 1, 1);
-  if (!pts || !E || !seen) { free(seen); goto out; }
-  float eps = fmaxf(1.0f, 0.7f * R);
+  seen = (uint8_t *)calloc((size_t)nl + 1, 1);
+  if (!pts || !E || !seen) goto out;
+  float eps = maxf(1.0f, 0.7f * R);
   for (int y = 0; y < h; y++)
     for (int x = 0; x < w; x++) {
       int l = lab[(size_t)y * w + x];
       if (!l || seen[l]) continue;
       seen[l] = 1;
       int n = trace(lab, l, w, h, x, y, &pts, &cap);
+      if (n < 0) goto out;
       if (n < 3) continue;
-      free(keep); free(stack);
-      keep = (uint8_t *)calloc(n + 2, 1);
-      stack = (int *)malloc(sizeof(int) * 4 * (n + 2));
-      if (!keep || !stack) continue;
+      /* room for the closing point, and for the simplification flags, stack and polygon */
+      if (n + 1 >= cap) {
+        int ncap = cap * 2;
+        float *np = (float *)realloc(pts, sizeof(float) * 2 * (size_t)ncap);
+        if (!np) goto out;
+        pts = np; cap = ncap;
+      }
+      if (n + 2 > kcap) {
+        int ncap = n + 2 > 2 * kcap ? n + 2 : 2 * kcap;
+        uint8_t *nk = (uint8_t *)realloc(keep, (size_t)ncap);
+        if (!nk) goto out;
+        keep = nk;
+        int *ns = (int *)realloc(stack, sizeof(int) * 4 * (size_t)ncap);
+        if (!ns) goto out;
+        stack = ns;
+        float *npl = (float *)realloc(poly, sizeof(float) * 2 * (size_t)ncap);
+        if (!npl) goto out;
+        poly = npl;
+        kcap = ncap;
+      }
+      memset(keep, 0, (size_t)n + 2);
       /* closed curve: split at the point farthest from the start */
       int far = 0; float fd = -1;
       for (int i = 1; i < n; i++) {
@@ -1040,20 +1223,17 @@ static void build_backing(ctx_t *c, const float *dist, float R, float *pb) {
         if (dd > fd) { fd = dd; far = i; }
       }
       /* append the start point so the second chain closes */
-      if (n + 1 >= cap) { cap *= 2; float *np = (float *)realloc(pts, sizeof(float) * 2 * cap); if (!np) continue; pts = np; }
       pts[2 * n] = pts[0]; pts[2 * n + 1] = pts[1];
       if (far > 0) { rdp(pts, 0, far, eps, keep, stack); rdp(pts, far, n, eps, keep, stack); }
       /* collect kept vertices, jitter like a hand cut */
       int nk = 0;
-      float *poly = (float *)malloc(sizeof(float) * 2 * (n + 1));
-      if (!poly) continue;
       for (int i = 0; i < n; i++)
         if (keep[i]) {
           poly[2 * nk] = pts[2 * i] + rr(-0.3f, 0.3f, (uint32_t)l, (uint32_t)nk, c->seed + 41u) * eps;
           poly[2 * nk + 1] = pts[2 * i + 1] + rr(-0.3f, 0.3f, (uint32_t)l, (uint32_t)nk, c->seed + 43u) * eps;
           nk++;
         }
-      if (nk < 3) { free(poly); continue; }
+      if (nk < 3) continue;
       float area = 0;
       for (int i = 0; i < nk; i++) { int j = (i + 1) % nk; area += poly[2 * i] * poly[2 * j + 1] - poly[2 * j] * poly[2 * i + 1]; }
       int flip = area < 0;
@@ -1061,16 +1241,19 @@ static void build_backing(ctx_t *c, const float *dist, float R, float *pb) {
         int a = flip ? nk - 1 - i : i, b = flip ? (nk - 2 - i + nk) % nk : (i + 1) % nk;
         float x0 = poly[2 * a], y0 = poly[2 * a + 1], x1 = poly[2 * b], y1 = poly[2 * b + 1];
         if (y0 == y1) continue;
-        if (ne >= ecap) { ecap *= 2; edge_t *nE = (edge_t *)realloc(E, sizeof(edge_t) * ecap); if (!nE) break; E = nE; }
+        if (ne >= ecap) {
+          int ncap = ecap * 2;
+          edge_t *nE = (edge_t *)realloc(E, sizeof(edge_t) * (size_t)ncap);
+          if (!nE) goto out;
+          E = nE; ecap = ncap;
+        }
         E[ne].x0 = x0; E[ne].y0 = y0; E[ne].x1 = x1; E[ne].y1 = y1; E[ne].dir = y1 > y0 ? 1 : -1; ne++;
       }
-      free(poly);
     }
-  free(seen);
-  if (ne) raster(E, ne, w, h, pb);
-  for (size_t i = 0; i < N; i++) if (pb[i] > 1.f) pb[i] = 1.f;
+  if (ne && raster(E, ne, w, h, pb))
+    for (size_t i = 0; i < N; i++) if (pb[i] > 1.f) pb[i] = 1.f;
 out:
-  free(mb); free(lab); free(pts); free(keep); free(stack); free(E);
+  free(mb); free(lab); free(seen); free(pts); free(poly); free(keep); free(stack); free(E);
 }
 
 static inline rgbf recolor(const ctx_t *c, float r, float g, float b, float x, float y) {
@@ -1089,10 +1272,10 @@ static inline rgbf recolor(const ctx_t *c, float r, float g, float b, float x, f
   float ref = c->accY[best]; /* the element's own average tone for this colour prints flat */
   float dY = Y - ref;
   if (dY < 0) {
-    float cov = clamp01(-dY / fmaxf(ref, 0.15f) * c->gain);
+    float cov = clamp01(-dY / maxf(ref, 0.15f) * c->gain);
     return mixc(base, c->ink, screen(&c->s_k, x, y, cov));
   }
-  float cov = clamp01(dY / fmaxf(1.f - ref, 0.15f) * c->gain);
+  float cov = clamp01(dY / maxf(1.f - ref, 0.15f) * c->gain);
   return mixc(base, c->paper, screen(&c->s_a, x, y, cov));
 }
 
@@ -1153,14 +1336,15 @@ static int is_flat(const ctx_t *c) {
 
 /* xerox / riso plates of the element (trailer cut-outs): auto levels, local contrast, edges */
 static int prep_plates(ctx_t *c, float *keyA, float *colA, int riso) {
-  int w = c->w, h = c->h;
+  int w = c->bw, h = c->bh; /* box coordinates; the box has room for the blur, so it matches a full-frame pass */
   size_t N = (size_t)w * h;
+#define BOXPX(i) (c->src + 4 * ((size_t)(c->by + (int)((i) / w)) * c->w + c->bx + (int)((i) % w)))
   float *L = (float *)malloc(sizeof(float) * N), *A = (float *)malloc(sizeof(float) * N);
   float *B = (float *)malloc(sizeof(float) * N), *BA = (float *)malloc(sizeof(float) * N), *T = (float *)malloc(sizeof(float) * N);
   if (!L || !A || !B || !BA || !T) { free(L); free(A); free(B); free(BA); free(T); return 0; }
   unsigned hist[256] = {0}; double tot = 0;
   for (size_t i = 0; i < N; i++) {
-    const uint8_t *q = c->src + 4 * i;
+    const uint8_t *q = BOXPX(i);
     A[i] = q[3] * (1.f / 255.f);
     L[i] = lum(q[0] / 255.f, q[1] / 255.f, q[2] / 255.f);
     if (q[3] >= 128) { hist[(int)(L[i] * 255.f + 0.5f)]++; tot++; }
@@ -1189,30 +1373,33 @@ static int prep_plates(ctx_t *c, float *keyA, float *colA, int riso) {
       float gy = (T[(size_t)(y < h - 1 ? y + 1 : y) * w + x] - T[(size_t)(y > 0 ? y - 1 : y) * w + x]) * 0.5f;
       float edge = smooth(0.045f, 0.11f, sqrtf(gx * gx + gy * gy) * c->k);
       float dark = powf(1.f - B[i], 1.15f);
-      const uint8_t *q = c->src + 4 * i;
-      float mx = fmaxf(fmaxf(q[0], q[1]), q[2]), mn = fminf(fminf(q[0], q[1]), q[2]);
+      const uint8_t *q = BOXPX(i);
+      float mx = maxf(maxf(q[0], q[1]), q[2]), mn = minf(minf(q[0], q[1]), q[2]);
       float sat = mx > 0 ? (mx - mn) / mx : 0.f;
       if (riso) {
         float key = powf(clamp01((dark - kth) * 1.5f), 1.1f);
-        keyA[i] = fmaxf(key, edge * 0.75f);
+        keyA[i] = maxf(key, edge * 0.75f);
         colA[i] = clamp01(0.25f + dark * 0.55f + sat * 0.25f);
       } else {
-        keyA[i] = fmaxf(powf(clamp01((dark - xth) * xg), 1.35f), edge * 0.8f);
+        keyA[i] = maxf(powf(clamp01((dark - xth) * xg), 1.35f), edge * 0.8f);
         colA[i] = 0.f;
       }
     }
   free(L); free(A); free(B); free(BA); free(T);
   return 1;
+#undef BOXPX
 }
 
 static void element_rows(void *vc, int y0, int y1) {
   ctx_t *c = (ctx_t *)vc;
-  int w = c->w, h = c->h;
+  int w = c->w;
+  static const float zero[4] = {0, 0, 0, 0};
   float far = 1e6f;
   rgbf sh = scalec(c->ink, 0.6f);
   int plates = c->estyle == ES_RISO || c->estyle == ES_XEROX;
   for (int y = y0; y < y1; y++)
     for (int x = 0; x < w; x++) {
+      if (y < c->ry0 || y >= c->ry1 || x < c->rx0 || x >= c->rx1) { store(c, (size_t)y * w + x, zero); continue; } /* nothing printed here */
       float nx = 0, ny = 0;
       if (c->amp > 0) rough_disp(c, (float)x, (float)y, &nx, &ny);
       float sx = nx * c->amp, sy = ny * c->amp, qx = nx * c->amp_paper, qy = ny * c->amp_paper;
@@ -1220,16 +1407,16 @@ static void element_rows(void *vc, int y0, int y1) {
       float d[4] = {0, 0, 0, 0};
       rgbf pap = paper_at(c, c->paper, (float)x, (float)y);
       if (c->has_paper) {
-        if (c->shop > 0) { float cs = samplef(c->pb, w, h, x - c->shx + qx, y - c->shy + qy); if (cs > 0) over(d, sh, cs * c->shop); }
-        if (c->underplate) { float cp = samplef(c->pb, w, h, x - c->misx + qx, y - c->misy + qy); if (cp > 0) over(d, c->plate, cp); }
-        float cb = samplef(c->pb, w, h, x + qx, y + qy);
+        if (c->shop > 0) { float cs = bsamp(c, c->pb, x - c->shx + qx, y - c->shy + qy); if (cs > 0) over(d, sh, cs * c->shop); }
+        if (c->underplate) { float cp = bsamp(c, c->pb, x - c->misx + qx, y - c->misy + qy); if (cp > 0) over(d, c->plate, cp); }
+        float cb = bsamp(c, c->pb, x + qx, y + qy);
         if (cb > 0) over(d, pap, cb);
       } else if (c->shop > 0) {
         float s4[4]; sample(c, x - c->shx + sx, y - c->shy + sy, 0, s4);
         if (s4[3] > 0) over(d, sh, smooth(0.2f, 0.8f, s4[3]) * c->shop);
       }
       if (c->outline_px > 0.01f) {
-        float dd = samplef_far(c->dist, w, h, x + sx, y + sy, far);
+        float dd = bsamp_far(c, c->dist, x + sx, y + sy, far);
         float co = clamp01(c->outline_px - dd + 0.5f);
         if (co > 0) over(d, c->ink, co);
       }
@@ -1241,14 +1428,14 @@ static void element_rows(void *vc, int y0, int y1) {
         rgbf col = O;
         if (plates) {
           col = mixc(O, pap, c->recolor);
-          amtK = screen(&c->s_k, hx, hy, samplef(c->keyA, w, h, x + sx, y + sy)) * c->recolor;
+          amtK = screen(&c->s_k, hx, hy, bsamp(c, c->keyA, x + sx, y + sy)) * c->recolor;
         } else if (c->estyle == ES_PALETTE && c->recolor > 0) {
           col = mixc(O, recolor(c, O.r, O.g, O.b, hx, hy), c->recolor);
         }
         over(d, col, a);
       }
       if (c->estyle == ES_RISO && c->recolor > 0) {
-        float cv = samplef(c->colA, w, h, x + sx - c->misx, y + sy - c->misy);
+        float cv = bsamp(c, c->colA, x + sx - c->misx, y + sy - c->misy);
         float amt = screen(&c->s_a, hx, hy, cv) * c->recolor;
         if (amt > 0) { d[0] *= lerpf(1.f, c->plate.r, amt); d[1] *= lerpf(1.f, c->plate.g, amt); d[2] *= lerpf(1.f, c->plate.b, amt); }
       }
@@ -1263,11 +1450,14 @@ static void element_rows(void *vc, int y0, int y1) {
 }
 
 static uint64_t fnv64(const void *p, size_t n, uint64_t hsh) {
-  const uint64_t *q = (const uint64_t *)p;
-  size_t nw = n / 8;
-  for (size_t i = 0; i < nw; i++) { hsh ^= q[i]; hsh *= 0x100000001b3ULL; }
   const uint8_t *b = (const uint8_t *)p;
-  for (size_t i = nw * 8; i < n; i++) { hsh ^= b[i]; hsh *= 0x100000001b3ULL; }
+  size_t i = 0;
+  for (; i + 8 <= n; i += 8) { /* memcpy: frames may be only 4-byte aligned, and no aliasing tricks */
+    uint64_t v;
+    memcpy(&v, b + i, sizeof(v));
+    hsh ^= v; hsh *= 0x100000001b3ULL;
+  }
+  for (; i < n; i++) { hsh ^= b[i]; hsh *= 0x100000001b3ULL; }
   return hsh;
 }
 
@@ -1290,23 +1480,49 @@ static void run_element(ctx_t *c) {
   int locked = in->mu_ok && pz_mutex_trylock(&in->mu);
   float *dist = NULL, *pb = NULL, *keyA = NULL, *colA = NULL;
   int own = 1, has = 0;
+  int bx = 0, by = 0, bw = 0, bh = 0;
   if (locked && in->ckey == key && in->cdist) {
     dist = in->cdist; pb = in->cpb; keyA = in->ckeyA; colA = in->ccolA; estyle = in->cstyle; has = in->chas; own = 0;
+    bx = in->cbx; by = in->cby; bw = in->cbw; bh = in->cbh;
   } else {
-    uint8_t *m = (uint8_t *)malloc(N);
-    dist = (float *)malloc(sizeof(float) * N);
-    pb = (float *)calloc(N, sizeof(float));
-    int any = 0;
-    if (m && dist && pb) {
-      for (size_t i = 0; i < N; i++) { m[i] = c->src[4 * i + 3] >= 128; any |= m[i]; }
-      if (any && edt(m, w, h, dist)) {
-        has = margin >= 0.75f;
-        if (has) build_backing(c, dist, c->outline_px + margin, pb);
-        if (estyle == ES_AUTO) estyle = is_flat(c) ? ES_PALETTE : ES_RISO;
-        if (estyle == ES_RISO || estyle == ES_XEROX) {
-          keyA = (float *)malloc(sizeof(float) * N); colA = (float *)malloc(sizeof(float) * N);
-          if (!keyA || !colA || !prep_plates(c, keyA, colA, estyle == ES_RISO)) { free(keyA); free(colA); keyA = colA = NULL; estyle = ES_ORIGINAL; }
-        }
+    /* only a box around the element is worked on: every visible pixel, plus room for the cut margin,
+       its straight scissor cuts and the plate blur. Graphics usually cover a small part of the frame. */
+    int ax0 = w, ay0 = h, ax1 = -1, ay1 = -1, any = 0;
+    for (int y = 0; y < h; y++) {
+      const uint8_t *row = c->src + 4 * (size_t)y * w;
+      for (int x = 0; x < w; x++) {
+        uint8_t a = row[4 * x + 3];
+        if (!a) continue;
+        if (x < ax0) ax0 = x;
+        if (x > ax1) ax1 = x;
+        if (y < ay0) ay0 = y;
+        if (y > ay1) ay1 = y;
+        any |= a >= 128;
+      }
+    }
+    uint8_t *m = NULL;
+    if (any) {
+      float R = c->outline_px + margin, eps = maxf(1.0f, 0.7f * R);
+      int pad = (int)ceilf(R + 1.5f * eps + 3.f * (6.f * c->k + 1.f)) + 6;
+      bx = ax0 - pad < 0 ? 0 : ax0 - pad; by = ay0 - pad < 0 ? 0 : ay0 - pad;
+      bw = (ax1 + 1 + pad > w ? w : ax1 + 1 + pad) - bx; bh = (ay1 + 1 + pad > h ? h : ay1 + 1 + pad) - by;
+      c->bx = bx; c->by = by; c->bw = bw; c->bh = bh;
+      size_t BN = (size_t)bw * bh;
+      m = (uint8_t *)malloc(BN);
+      dist = (float *)malloc(sizeof(float) * BN);
+      pb = (float *)calloc(BN, sizeof(float));
+      if (m && dist && pb) {
+        for (int y = 0; y < bh; y++)
+          for (int x = 0; x < bw; x++) m[(size_t)y * bw + x] = c->src[4 * ((size_t)(by + y) * w + bx + x) + 3] >= 128;
+        if (edt(m, bw, bh, dist)) {
+          has = margin >= 0.75f;
+          if (has) build_backing(c, dist, R, pb);
+          if (estyle == ES_AUTO) estyle = is_flat(c) ? ES_PALETTE : ES_RISO;
+          if (estyle == ES_RISO || estyle == ES_XEROX) {
+            keyA = (float *)malloc(sizeof(float) * BN); colA = (float *)malloc(sizeof(float) * BN);
+            if (!keyA || !colA || !prep_plates(c, keyA, colA, estyle == ES_RISO)) { free(keyA); free(colA); keyA = colA = NULL; estyle = ES_ORIGINAL; }
+          }
+        } else any = 0;
       } else any = 0;
     }
     free(m);
@@ -1319,10 +1535,16 @@ static void run_element(ctx_t *c) {
     if (locked) { /* keep for the next frame */
       free(in->cdist); free(in->cpb); free(in->ckeyA); free(in->ccolA);
       in->cdist = dist; in->cpb = pb; in->ckeyA = keyA; in->ccolA = colA; in->cstyle = estyle; in->chas = has; in->ckey = key;
+      in->cbx = bx; in->cby = by; in->cbw = bw; in->cbh = bh;
       own = 0;
     }
   }
   c->estyle = estyle; c->has_paper = has; c->dist = dist; c->pb = pb; c->keyA = keyA; c->colA = colA;
+  c->bx = bx; c->by = by; c->bw = bw; c->bh = bh;
+  { /* output pixels that can receive anything: the box, pushed by the rough edge, the shadow and the plate offset */
+    int reach = (int)ceilf(1.6f * c->amp + fabsf(c->shx) + fabsf(c->shy) + fabsf(c->misx) + fabsf(c->misy)) + 2;
+    c->rx0 = bx - reach; c->ry0 = by - reach; c->rx1 = bx + bw + reach; c->ry1 = by + bh + reach;
+  }
   c->s_k = mkscreen(c->cell * 0.75f, c->ang); c->s_a = mkscreen(c->cell * 0.86f, c->ang - 30.f);
   c->underplate = (estyle == ES_PALETTE || estyle == ES_ORIGINAL) && (c->misx != 0 || c->misy != 0);
   if (estyle == ES_PALETTE) {
@@ -1343,14 +1565,26 @@ static void run_element(ctx_t *c) {
     for (int i = 0; i < 3; i++) c->accY[i] = cnt[i] > 0 ? (float)(sum[i] / cnt[i]) : lum(A[i].r, A[i].g, A[i].b);
     c->gain = 1.f + 3.f * clampf((float)in->p[P_CONTRAST], 0, 1);
   }
-  par_rows(element_rows, c, 0, h, (long)N);
+  par_rows(element_rows, c, 0, h, (int64_t)N);
   if (locked) pz_mutex_unlock(&in->mu);
   if (own) { free(dist); free(pb); free(keyA); free(colA); }
 }
 
 /* ================================================================== frei0r API */
-int f0r_init(void) { pz_once(init_tables); return 1; }
-void f0r_deinit(void) {}
+int f0r_init(void) {
+  pz_tables_lock();
+  init_tables();
+  int ok = tables_ready();
+  if (ok) g_inits++;
+  pz_tables_unlock();
+  return ok;
+}
+void f0r_deinit(void) {
+  pz_tables_lock();
+  if (g_inits > 0) g_inits--;
+  if (!g_inits && !g_live) tables_free();
+  pz_tables_unlock();
+}
 
 void f0r_get_plugin_info(f0r_plugin_info_t *info) {
   info->name = "Punk Zine";
@@ -1374,10 +1608,23 @@ void f0r_get_param_info(f0r_param_info_t *info, int i) {
 static rgbf hexc(uint32_t v) { rgbf c = {((v >> 16) & 255) / 255.f, ((v >> 8) & 255) / 255.f, (v & 255) / 255.f}; return c; }
 
 f0r_instance_t f0r_construct(unsigned int width, unsigned int height) {
-  pz_once(init_tables);
-  if (!g_noise || !g_paper) return NULL;
+  /* frame offsets are computed in size_t from int coordinates; the largest
+     per-pixel buffer is 16 bytes (the float RGBA accumulator) */
+  if (!width || !height || width > 32768 || height > 32768) return NULL;
+  pz_tables_lock();
+  init_tables(); /* normally done by f0r_init() already */
+  int ok = tables_ready();
+  if (ok) g_live++;
+  pz_tables_unlock();
+  if (!ok) return NULL;
   inst_t *in = (inst_t *)calloc(1, sizeof(inst_t));
-  if (!in) return NULL;
+  if (!in) {
+    pz_tables_lock();
+    g_live--;
+    if (!g_inits && !g_live) tables_free();
+    pz_tables_unlock();
+    return NULL;
+  }
   in->w = width; in->h = height;
   in->mu_ok = pz_mutex_init(&in->mu);
   for (int i = 0; i < NPARAM; i++) {
@@ -1392,6 +1639,10 @@ void f0r_destruct(f0r_instance_t inst) {
   free(in->cdist); free(in->cpb); free(in->ckeyA); free(in->ccolA);
   if (in->mu_ok) pz_mutex_destroy(&in->mu);
   free(in);
+  pz_tables_lock();
+  if (g_live > 0) g_live--;
+  if (!g_inits && !g_live) tables_free();
+  pz_tables_unlock();
 }
 
 void f0r_set_param_value(f0r_instance_t inst, f0r_param_t param, int i) {
@@ -1399,12 +1650,16 @@ void f0r_set_param_value(f0r_instance_t inst, f0r_param_t param, int i) {
   if (!in || !param || i < 0 || i >= NPARAM) return;
   if (PDEF[i].type == F0R_PARAM_COLOR) {
     const f0r_param_color_t *c = (const f0r_param_color_t *)param;
-    rgbf v = {clamp01(c->r), clamp01(c->g), clamp01(c->b)};
+    rgbf v = in->col[i - FIRSTCOL]; /* a non-finite component keeps the current value */
+    if (isfinite(c->r)) v.r = clamp01(c->r);
+    if (isfinite(c->g)) v.g = clamp01(c->g);
+    if (isfinite(c->b)) v.b = clamp01(c->b);
     in->col[i - FIRSTCOL] = v;
   } else {
+    /* every value stays in the API's 0..1 range, so the getter returns what the plugin uses */
     double v = *(const double *)param;
-    if (v != v) v = PDEF[i].def; /* NaN */
-    in->p[i] = v;
+    if (!isfinite(v)) return;
+    in->p[i] = v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v);
   }
 }
 void f0r_get_param_value(f0r_instance_t inst, f0r_param_t param, int i) {
@@ -1478,12 +1733,16 @@ void f0r_update(f0r_instance_t inst, double time, const uint32_t *inframe, uint3
       for (size_t i = 0; i < N; i += st) { const uint8_t *q = src + 4 * i; hist[(int)(lum(q[0], q[1], q[2]) + 0.5f) & 255]++; tot++; }
       int lo = 0, hi = 255, got = 0;
       for (int b = 0; b < 256; b++) { run += hist[b]; if (!got && run >= 0.01 * tot) { lo = b; got = 1; } if (run >= 0.99 * tot) { hi = b; break; } }
-      if (hi - lo < 40) { int mid = (hi + lo) / 2; lo = mid - 20 < 0 ? 0 : mid - 20; hi = lo + 40; }
-      c.lv_lo = lo / 255.f; c.lv_inv = 255.f / (float)(hi - lo);
+      float flo = (float)lo, fhi = (float)hi;
+      if (hi - lo < 40) { /* flat frame: widen to 40 levels, keeping its place in 0..255 (white stays white) */
+        float d = 40.f - (fhi - flo), room = flo + (255.f - fhi);
+        flo -= d * flo / room; fhi += d * (255.f - fhi) / room;
+      }
+      c.lv_lo = flo / 255.f; c.lv_inv = 255.f / (fhi - flo);
     }
     c.wob = (1.f * rough + 3.f * rough * rough) * c.k;
     c.jit = rough * 0.4f * cell;
-    par_rows(image_rows, &c, 0, h, (long)N);
+    par_rows(image_rows, &c, 0, h, (int64_t)N);
   } else {
     int done = 0;
     if (mode == -1 || mode == 1) {
